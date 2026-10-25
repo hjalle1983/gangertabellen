@@ -95,6 +95,9 @@ input:focus { border-color: var(--accent); outline: none; }
 .t { font-family: var(--display); font-weight: 600; font-variant-numeric: tabular-nums; }
 .scores li.mine { background: color-mix(in srgb, var(--gold) 16%, transparent); border-radius: 6px; padding-inline: 6px; margin-inline: -6px; }
 .empty { color: var(--muted); margin: 0; font-size: .9rem; }
+.tabs { display: flex; gap: 4px; background: var(--bg); border-radius: 10px; padding: 3px; }
+.tabs button { font: 600 .85rem var(--display); color: var(--muted); background: transparent; border: 0; border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+.tabs button[aria-pressed="true"] { background: var(--card); color: var(--fg); box-shadow: 0 1px 2px rgb(0 0 0 / .12); }
 </style>
 
 <main>
@@ -127,7 +130,13 @@ input:focus { border-color: var(--accent); outline: none; }
   </section>
 
   <section class="card scores">
-    <h2>Topplista</h2>
+    <h2>Topplista
+      <span class="tabs" id="tabs">
+        <button data-p="day" aria-pressed="true">Idag</button>
+        <button data-p="week" aria-pressed="false">Veckan</button>
+        <button data-p="all" aria-pressed="false">Totalt</button>
+      </span>
+    </h2>
     <ol id="list"></ol>
     <p class="empty" id="empty">Inga resultat än. Bli först på listan!</p>
   </section>
@@ -135,23 +144,42 @@ input:focus { border-color: var(--accent); outline: none; }
 
 <script>
 (() => {
-  const N = 20, KEY = "gangertabell-scores-v3", NAMEKEY = "gangertabell-name";
+  const N = 20, KEY = "gangertabell-scores-v4", NAMEKEY = "gangertabell-name";
   // Gemensam topplista i Supabase. Publishable key är avsedd att ligga publikt; RLS tillåter bara läsa + lägga till.
   const SB = "https://qgkplqqtrmckgjmdsove.supabase.co/rest/v1/scores", SBKEY = "sb_publishable_x_t_yU9DIk3bQ7ghtwxROA_P2RYR70m";
   const sbHeaders = { apikey: SBKEY, "Content-Type": "application/json" };
   const $ = id => document.getElementById(id);
   const fmt = s => s.toFixed(1).replace(".", ",") + " s";
   const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  const cached = () => { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch { return []; } };
+  const cached = () => { try { return JSON.parse(localStorage.getItem(KEY)) || {}; } catch { return {}; } };
   const cache = l => { try { localStorage.setItem(KEY, JSON.stringify(l)); } catch {} };
   const day = iso => new Date(iso).toLocaleDateString("sv-SE", { day: "numeric", month: "short" });
-  let scores = cached();
+  const PERIODS = ["day", "week", "all"];
+  const EMPTY = { day: "Ingen har spelat idag än. Bli först!", week: "Ingen har spelat den här veckan än. Bli först!", all: "Inga resultat än. Bli först på listan!" };
+  const RECORD = { day: "Dagens bästa!", week: "Veckans bästa!", all: "Nytt rekord!" };
+  let scores = { day: [], week: [], all: [], ...cached() }, period = "day";
+
+  // Periodstart i lokal tid: idag 00:00 resp. måndag 00:00
+  function since(p) {
+    if (p === "all") return null;
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    if (p === "week") d.setDate(d.getDate() - (d.getDay() + 6) % 7);
+    return d.toISOString();
+  }
+
+  async function fetchPeriod(p) {
+    const from = since(p);
+    const r = await fetch(SB + "?select=id,name,correct,time,created_at&order=correct.desc,time.asc,created_at.asc&limit=10"
+      + (from ? "&created_at=gte." + encodeURIComponent(from) : ""), { headers: sbHeaders });
+    if (!r.ok) throw new Error(r.status);
+    return r.json();
+  }
 
   async function fetchScores() {
     try {
-      const r = await fetch(SB + "?select=id,name,correct,time,created_at&order=correct.desc,time.asc,created_at.asc&limit=10", { headers: sbHeaders });
-      if (!r.ok) throw new Error(r.status);
-      scores = await r.json(); cache(scores);
+      const lists = await Promise.all(PERIODS.map(fetchPeriod));
+      PERIODS.forEach((p, i) => scores[p] = lists[i]);
+      cache(scores);
     } catch {}
     return scores;
   }
@@ -230,16 +258,19 @@ input:focus { border-color: var(--accent); outline: none; }
     if (document.activeElement) document.activeElement.blur();
 
     const better = (x, y) => y.correct - x.correct || x.time - y.time;
-    const prevBest = (await fetchScores())[0];
+    const prev = await fetchScores();
     const entry = { name: $("name").value.trim(), correct, time: Math.round(time * 10) / 10 };
-    $("record").hidden = !(!prevBest || better(entry, prevBest) < 0);
+    const best = [...PERIODS].reverse().find(p => !prev[p][0] || better(entry, prev[p][0]) < 0);
+    $("record").hidden = !best;
+    if (best) $("record").textContent = RECORD[best];
     lastId = await postScore(entry);
     await fetchScores();
     renderScores();
   }
 
   function renderScores() {
-    const l = scores;
+    const l = scores[period];
+    $("empty").textContent = EMPTY[period];
     $("empty").hidden = l.length > 0;
     $("list").innerHTML = l.map((s, i) => `
       <li class="${s.id === lastId ? "mine" : ""}">
@@ -257,6 +288,13 @@ input:focus { border-color: var(--accent); outline: none; }
     if (!playing && !$("res").hidden) { start(); return; }
     playing = false; $("game").hidden = true; $("start").hidden = false;
   });
+  $("tabs").addEventListener("click", e => {
+    const b = e.target.closest("button"); if (!b) return;
+    period = b.dataset.p;
+    $("tabs").querySelectorAll("button").forEach(x => x.setAttribute("aria-pressed", x === b));
+    renderScores();
+  });
+
   renderScores();
   fetchScores().then(renderScores);
 })();
