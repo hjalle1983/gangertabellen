@@ -127,7 +127,7 @@ input:focus { border-color: var(--accent); outline: none; }
   </section>
 
   <section class="card scores">
-    <h2>Topplista <button class="btn ghost" id="clear">Rensa</button></h2>
+    <h2>Topplista</h2>
     <ol id="list"></ol>
     <p class="empty" id="empty">Inga resultat än. Bli först på listan!</p>
   </section>
@@ -135,15 +135,37 @@ input:focus { border-color: var(--accent); outline: none; }
 
 <script>
 (() => {
-  const N = 20, KEY = "gangertabell-scores-v2", NAMEKEY = "gangertabell-name";
+  const N = 20, KEY = "gangertabell-scores-v3", NAMEKEY = "gangertabell-name";
+  // Gemensam topplista i Supabase. Publishable key är avsedd att ligga publikt; RLS tillåter bara läsa + lägga till.
+  const SB = "https://qgkplqqtrmckgjmdsove.supabase.co/rest/v1/scores", SBKEY = "sb_publishable_x_t_yU9DIk3bQ7ghtwxROA_P2RYR70m";
+  const sbHeaders = { apikey: SBKEY, "Content-Type": "application/json" };
   const $ = id => document.getElementById(id);
   const fmt = s => s.toFixed(1).replace(".", ",") + " s";
   const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  const load = () => { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch { return []; } };
-  const save = l => { try { localStorage.setItem(KEY, JSON.stringify(l)); } catch {} };
+  const cached = () => { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch { return []; } };
+  const cache = l => { try { localStorage.setItem(KEY, JSON.stringify(l)); } catch {} };
+  const day = iso => new Date(iso).toLocaleDateString("sv-SE", { day: "numeric", month: "short" });
+  let scores = cached();
+
+  async function fetchScores() {
+    try {
+      const r = await fetch(SB + "?select=id,name,correct,time,created_at&order=correct.desc,time.asc,created_at.asc&limit=10", { headers: sbHeaders });
+      if (!r.ok) throw new Error(r.status);
+      scores = await r.json(); cache(scores);
+    } catch {}
+    return scores;
+  }
+
+  async function postScore(entry) {
+    try {
+      const r = await fetch(SB, { method: "POST", headers: { ...sbHeaders, Prefer: "return=representation" }, body: JSON.stringify(entry) });
+      if (!r.ok) throw new Error(r.status);
+      return (await r.json())[0].id;
+    } catch { return null; }
+  }
   try { $("name").value = localStorage.getItem(NAMEKEY) || ""; } catch {}
 
-  let tasks = [], t0 = 0, playing = false, lastId = null, confirmClear = false;
+  let tasks = [], t0 = 0, playing = false, lastId = null;
 
   function makeTasks() {
     const pool = [];
@@ -181,12 +203,12 @@ input:focus { border-color: var(--accent); outline: none; }
     renderGrid();
     $("res").hidden = true; $("done").hidden = false; $("quit").textContent = "Avbryt";
     $("start").hidden = true; $("game").hidden = false;
-    renderScores();
+    fetchScores().then(renderScores);
     $("a0").focus();
     t0 = performance.now();
   }
 
-  function finish() {
+  async function finish() {
     if (!playing) return;
     playing = false;
     const time = (performance.now() - t0) / 1000;
@@ -199,34 +221,30 @@ input:focus { border-color: var(--accent); outline: none; }
       else q.insertAdjacentHTML("beforeend", `<span class="fix">Rätt svar: ${a * b}</span>`);
     });
 
-    const l = load();
-    const better = (x, y) => y.correct - x.correct || x.time - y.time;
-    const prevBest = l[0];
-    const entry = { id: Date.now(), name: $("name").value.trim(), correct, time,
-      date: new Date().toLocaleDateString("sv-SE", { day: "numeric", month: "short" }) };
-    l.push(entry); l.sort(better);
-    const place = l.indexOf(entry) + 1;
-    save(l.slice(0, 10));
-    lastId = place <= 10 ? entry.id : null;
-
     $("rCorrect").textContent = correct;
     $("rTime").textContent = fmt(time);
-    $("record").hidden = !(place === 1 && (!prevBest || better(entry, prevBest) < 0));
+    $("record").hidden = true;
     $("res").hidden = false;
     $("done").hidden = true;
     $("quit").textContent = "Kör igen";
     if (document.activeElement) document.activeElement.blur();
+
+    const better = (x, y) => y.correct - x.correct || x.time - y.time;
+    const prevBest = (await fetchScores())[0];
+    const entry = { name: $("name").value.trim(), correct, time: Math.round(time * 10) / 10 };
+    $("record").hidden = !(!prevBest || better(entry, prevBest) < 0);
+    lastId = await postScore(entry);
+    await fetchScores();
     renderScores();
   }
 
   function renderScores() {
-    const l = load();
+    const l = scores;
     $("empty").hidden = l.length > 0;
-    $("clear").hidden = l.length === 0;
     $("list").innerHTML = l.map((s, i) => `
       <li class="${s.id === lastId ? "mine" : ""}">
         <span class="rank">${i + 1}</span>
-        <span class="who">${esc(s.name || "Okänd")} <small>${s.date}</small></span>
+        <span class="who">${esc(s.name || "Okänd")} <small>${day(s.created_at)}</small></span>
         <span class="t">${s.correct}/20</span>
         <span class="t">${fmt(s.time)}</span>
       </li>`).join("");
@@ -239,12 +257,8 @@ input:focus { border-color: var(--accent); outline: none; }
     if (!playing && !$("res").hidden) { start(); return; }
     playing = false; $("game").hidden = true; $("start").hidden = false;
   });
-  $("clear").addEventListener("click", () => {
-    if (!confirmClear) { confirmClear = true; $("clear").textContent = "Säker?"; setTimeout(() => { confirmClear = false; $("clear").textContent = "Rensa"; }, 3000); return; }
-    save([]); confirmClear = false; $("clear").textContent = "Rensa"; lastId = null; renderScores();
-  });
-
   renderScores();
+  fetchScores().then(renderScores);
 })();
 </script>
 
